@@ -1,6 +1,3 @@
 #!/bin/bash
 
-rm fiat_doublestack_mod.F90
-rm *.o
-rm *.mod
-rm *.x
+rm fiat_doublestack_mod.F90 fiat_heap_mod.F90 fiat_tbbpool_mod.F90 *.o *.mod *.x &> /dev/null

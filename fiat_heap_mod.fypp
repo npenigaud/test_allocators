@@ -1,0 +1,173 @@
+MODULE FIAT_HEAP_MOD
+
+USE EC_PARKIND, ONLY : JPIM, JPIB, JPRM, JPRD
+USE ISO_C_BINDING, ONLY : C_PTR, C_SIZE_T, C_LOC, C_F_POINTER, C_ASSOCIATED, C_NULL_PTR
+
+IMPLICIT NONE
+
+INTERFACE
+
+  SUBROUTINE FIAT_HEAP_NEW (HEAP, SIZE) BIND (C, NAME='fiat_heap_new')
+    IMPORT :: C_PTR, C_SIZE_T
+    TYPE (C_PTR), INTENT(OUT) :: HEAP
+    INTEGER (C_SIZE_T), VALUE, INTENT(IN) :: SIZE
+  END SUBROUTINE
+
+  SUBROUTINE FIAT_HEAP_DELETE (HEAP) BIND (C, NAME='fiat_heap_delete')
+    IMPORT :: C_PTR
+    TYPE (C_PTR), VALUE, INTENT(IN) :: HEAP
+  END SUBROUTINE
+
+  SUBROUTINE FIAT_HEAP_ALLOCATE (HEAP, SIZE, PTR) BIND (C, NAME='fiat_heap_allocate')
+    IMPORT :: C_PTR, C_SIZE_T
+    TYPE (C_PTR), INTENT(IN), VALUE :: HEAP
+    INTEGER (C_SIZE_T), VALUE, INTENT(IN) :: SIZE
+    TYPE (C_PTR), INTENT(OUT) :: PTR
+  END SUBROUTINE
+
+  SUBROUTINE FIAT_HEAP_DEALLOCATE (HEAP, PTR) BIND (C, NAME='fiat_heap_deallocate')
+    IMPORT :: C_PTR
+    TYPE (C_PTR), VALUE, INTENT(IN) :: HEAP
+    TYPE (C_PTR), VALUE, INTENT(IN) :: PTR
+  END SUBROUTINE
+
+END INTERFACE
+
+PRIVATE 
+
+#:set ranks = list (range (1,6))
+#:set types = ['INTEGER', 'INTEGER', 'REAL', 'REAL']
+#:set kinds = ['IM', 'IB', 'RM', 'RD']
+
+PUBLIC :: FIAT_HEAP
+
+TYPE FIAT_HEAP
+  TYPE (C_PTR) :: PTR = C_NULL_PTR
+CONTAINS
+  PROCEDURE :: INIT => FIAT_HEAP_INIT
+  PROCEDURE :: FINAL => FIAT_HEAP_FINAL
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+  PROCEDURE, PRIVATE :: FIAT_ALLOCATE_${rank}$${kind}$
+  GENERIC :: ALLOCATE => FIAT_ALLOCATE_${rank}$${kind}$
+#:if rank == 1
+  PROCEDURE, PRIVATE :: FIAT_GROW_${rank}$${kind}$
+  GENERIC :: GROW => FIAT_GROW_${rank}$${kind}$
+#:endif
+#:endfor
+#:endfor
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+  PROCEDURE, PRIVATE :: FIAT_DEALLOCATE_${rank}$${kind}$
+  GENERIC :: DEALLOCATE => FIAT_DEALLOCATE_${rank}$${kind}$
+#:endfor
+#:endfor
+END TYPE FIAT_HEAP
+
+CONTAINS
+
+SUBROUTINE FIAT_HEAP_INIT (SELF, SIZE)
+
+CLASS (FIAT_HEAP) :: SELF
+INTEGER (KIND=C_SIZE_T), INTENT (IN) :: SIZE
+
+CALL FIAT_HEAP_NEW (SELF%PTR, SIZE)
+
+END SUBROUTINE FIAT_HEAP_INIT
+
+SUBROUTINE FIAT_HEAP_FINAL (SELF)
+
+CLASS (FIAT_HEAP) :: SELF
+
+CALL FIAT_HEAP_DELETE (SELF%PTR)
+
+SELF%PTR = C_NULL_PTR
+
+END SUBROUTINE FIAT_HEAP_FINAL
+
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+
+#:set suffix = str (rank) + kind
+
+SUBROUTINE FIAT_ALLOCATE_${suffix}$ (SELF, P, UBOUNDS, LBOUNDS)
+
+CLASS (FIAT_HEAP) :: SELF
+${type}$ (KIND=JP${kind}$), POINTER :: P (${ ','.join ([':'] * rank) }$) 
+INTEGER (KIND=JPIM), INTENT (IN) :: UBOUNDS (${rank}$)
+INTEGER (KIND=JPIM), INTENT (IN), OPTIONAL :: LBOUNDS (${rank}$)
+
+INTEGER (KIND=JPIM) :: ILBOUNDS (${rank}$)
+TYPE (C_PTR) :: PTR
+INTEGER (KIND=C_SIZE_T) :: ISIZE
+
+ILBOUNDS = 1
+
+IF (PRESENT (LBOUNDS)) ILBOUNDS = LBOUNDS
+
+IF (.NOT. C_ASSOCIATED (SELF%PTR)) THEN
+  ALLOCATE (P (${','.join (map (lambda i: "ILBOUNDS(" + str (i) + "):UBOUNDS (" + str (i) + ")", range (1, rank+1)))}$))
+  RETURN
+ENDIF
+
+ISIZE = INT (KIND (P), C_SIZE_T)
+#:for i in range (1, rank+1, 1)
+ISIZE = ISIZE * INT (UBOUNDS(${i}$)-ILBOUNDS(${i}$)+1, C_SIZE_T)
+#:endfor
+
+CALL FIAT_HEAP_ALLOCATE (SELF%PTR, ISIZE, PTR)
+
+CALL C_F_POINTER (PTR, P, UBOUNDS-ILBOUNDS+1)
+
+P (${ ', '.join (map (lambda i: 'ILBOUNDS (' + str (i) + '):', range (1, rank+1))) }$) => P
+
+END SUBROUTINE FIAT_ALLOCATE_${suffix}$
+
+#:if rank == 1
+SUBROUTINE FIAT_GROW_${suffix}$ (SELF, P, UBOUNDS)
+
+CLASS (FIAT_HEAP) :: SELF
+${type}$ (KIND=JP${kind}$), POINTER :: P (:)
+INTEGER (KIND=JPIM), INTENT (IN) :: UBOUNDS (1)
+
+IF (ASSOCIATED (P)) THEN
+  IF (UBOUNDS (1) <= SIZE (P)) THEN
+    RETURN
+  ENDIF
+ENDIF
+
+CALL SELF%DEALLOCATE (P)
+CALL SELF%ALLOCATE (P, UBOUNDS)
+
+END SUBROUTINE FIAT_GROW_${suffix}$
+#:endif
+
+SUBROUTINE FIAT_DEALLOCATE_${suffix}$ (SELF, P)
+
+CLASS (FIAT_HEAP) :: SELF
+${type}$ (KIND=JP${kind}$), POINTER :: P (${ ','.join ([':'] * rank) }$) 
+
+TYPE (C_PTR) :: PTR
+
+IF (.NOT. ASSOCIATED (P)) THEN
+  RETURN
+ENDIF
+
+IF (.NOT. C_ASSOCIATED (SELF%PTR)) THEN
+  DEALLOCATE (P)
+  P => NULL ()
+  RETURN
+ENDIF
+
+PTR = C_LOC (P (${ ', '.join (map (lambda i: 'LBOUND (P, ' + str (i) + ')', range (1, rank+1))) }$))
+
+CALL FIAT_HEAP_DEALLOCATE (SELF%PTR, PTR)
+
+P => NULL ()
+
+END SUBROUTINE FIAT_DEALLOCATE_${suffix}$
+
+#:endfor
+#:endfor
+
+END MODULE FIAT_HEAP_MOD

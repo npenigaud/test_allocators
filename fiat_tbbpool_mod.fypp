@@ -1,0 +1,227 @@
+! Remplaçant de FIAT_DOUBLESTACK_MOD basé sur tbb::fixed_pool (via tbbpool.cpp).
+! Même interface publique : INIT, FINAL, ALLOCATE (ptr, ubounds, lbounds, side_param), DEALLOCATE (ptr).
+! Non compilé ni testé : à valider sur votre machine.
+MODULE FIAT_TBBPOOL_MOD
+
+USE EC_PARKIND, ONLY : JPIM, JPIB, JPRM, JPRD
+USE ISO_C_BINDING, ONLY : C_PTR, C_SIZE_T, C_INT, C_INT8_T, C_LOC, C_F_POINTER, C_ASSOCIATED, C_NULL_PTR
+
+IMPLICIT NONE
+
+PRIVATE
+
+#:set ranks = list (range (1,6))
+#:set types = ['INTEGER', 'INTEGER', 'REAL', 'REAL']
+#:set kinds = ['IM', 'IB', 'RM', 'RD']
+#:set bounds = ['IM','IB']
+
+PUBLIC :: FIAT_TBBPOOL
+
+TYPE FIAT_TBBPOOL
+  TYPE(C_PTR) :: HANDLE = C_NULL_PTR
+  ! arène vue comme un tableau d'octets (sert au miroir GPU, comme PTR dans FIAT_DOUBLESTACK)
+  INTEGER(KIND=C_INT8_T), POINTER, CONTIGUOUS :: PTR(:) => NULL()
+  LOGICAL                :: LLGPU = .FALSE.
+  INTEGER(KIND=C_SIZE_T) :: ALIGNMENT = 128
+CONTAINS
+  PROCEDURE :: INIT => FIAT_TBBPOOL_INIT
+  PROCEDURE :: FINAL => FIAT_TBBPOOL_FINAL
+  PROCEDURE :: RECYCLE => FIAT_TBBPOOL_RECYCLE
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+#:for bound in bounds
+  PROCEDURE, PRIVATE :: FIAT_TBBALLOCATE_${bound}$${rank}$${kind}$
+  GENERIC :: ALLOCATE => FIAT_TBBALLOCATE_${bound}$${rank}$${kind}$
+#:endfor
+#:endfor
+#:endfor
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+  PROCEDURE, PRIVATE :: FIAT_TBBDEALLOCATE_${rank}$${kind}$
+  GENERIC :: DEALLOCATE => FIAT_TBBDEALLOCATE_${rank}$${kind}$
+#:endfor
+#:endfor
+END TYPE FIAT_TBBPOOL
+
+INTERFACE
+FUNCTION TBBPOOL_CREATE (NBYTES, ALIGN, PINNED) BIND(C, NAME='tbbpool_create')
+  IMPORT C_PTR, C_SIZE_T, C_INT
+  TYPE(C_PTR) :: TBBPOOL_CREATE
+  INTEGER(C_SIZE_T), VALUE :: NBYTES
+  INTEGER(C_SIZE_T), VALUE :: ALIGN
+  INTEGER(C_INT), VALUE    :: PINNED
+END FUNCTION TBBPOOL_CREATE
+FUNCTION TBBPOOL_BUFFER (H) BIND(C, NAME='tbbpool_buffer')
+  IMPORT C_PTR
+  TYPE(C_PTR) :: TBBPOOL_BUFFER
+  TYPE(C_PTR), VALUE :: H
+END FUNCTION TBBPOOL_BUFFER
+FUNCTION TBBPOOL_ALLOC (H, NBYTES) BIND(C, NAME='tbbpool_alloc')
+  IMPORT C_PTR, C_SIZE_T
+  TYPE(C_PTR) :: TBBPOOL_ALLOC
+  TYPE(C_PTR), VALUE       :: H
+  INTEGER(C_SIZE_T), VALUE :: NBYTES
+END FUNCTION TBBPOOL_ALLOC
+SUBROUTINE TBBPOOL_FREE (H, P) BIND(C, NAME='tbbpool_free')
+  IMPORT C_PTR
+  TYPE(C_PTR), VALUE :: H
+  TYPE(C_PTR), VALUE :: P
+END SUBROUTINE TBBPOOL_FREE
+SUBROUTINE TBBPOOL_RECYCLE (H) BIND(C, NAME='tbbpool_recycle')
+  IMPORT C_PTR
+  TYPE(C_PTR), VALUE :: H
+END SUBROUTINE TBBPOOL_RECYCLE
+SUBROUTINE TBBPOOL_DESTROY (H) BIND(C, NAME='tbbpool_destroy')
+  IMPORT C_PTR
+  TYPE(C_PTR), VALUE :: H
+END SUBROUTINE TBBPOOL_DESTROY
+END INTERFACE
+
+CONTAINS
+
+SUBROUTINE FIAT_TBBPOOL_INIT (SELF, SIZE, LDGPU, LDPINNED)
+
+CLASS (FIAT_TBBPOOL) :: SELF
+INTEGER (KIND=C_SIZE_T), INTENT (IN) :: SIZE
+LOGICAL, INTENT(IN), OPTIONAL :: LDGPU      ! miroir device de l'arène (OpenACC / OpenMP), comme avant
+LOGICAL, INTENT(IN), OPTIONAL :: LDPINNED   ! arène en mémoire épinglée (cudaHostAlloc)
+
+INTEGER(KIND=C_INT) :: IPINNED
+
+SELF%LLGPU = .FALSE.
+IF (PRESENT(LDGPU)) SELF%LLGPU = LDGPU
+IPINNED = 0_C_INT
+IF (PRESENT(LDPINNED)) THEN
+  IF (LDPINNED) IPINNED = 1_C_INT
+ENDIF
+
+WRITE (0,*) "fiat_tbbpool_init: arena of ",SIZE,"bytes"
+SELF%HANDLE = TBBPOOL_CREATE (SIZE, SELF%ALIGNMENT, IPINNED)
+IF (.NOT. C_ASSOCIATED (SELF%HANDLE)) THEN
+  WRITE (0,*) "ERROR : TBBPOOL_CREATE FAILED, FIAT_TBBPOOL_MOD"
+  CALL ABORT
+ENDIF
+
+CALL C_F_POINTER (TBBPOOL_BUFFER (SELF%HANDLE), SELF%PTR, [SIZE])
+
+IF (SELF%LLGPU) THEN
+  WRITE (0,*) "entering on gpu"
+#ifdef ACCGPU
+  !$ACC ENTER DATA CREATE(SELF%PTR)
+#endif
+#ifdef OMPGPU
+  !$OMP TARGET ENTER DATA MAP(ALLOC:SELF%PTR)
+#endif
+ENDIF
+
+END SUBROUTINE FIAT_TBBPOOL_INIT
+
+SUBROUTINE FIAT_TBBPOOL_FINAL (SELF)
+
+CLASS (FIAT_TBBPOOL) :: SELF
+
+IF (SELF%LLGPU) THEN
+  WRITE (0,*) "deallocating on gpu"
+#ifdef ACCGPU
+  !$ACC EXIT DATA DELETE(SELF%PTR)
+#endif
+#ifdef OMPGPU
+  !$OMP TARGET EXIT DATA MAP(DELETE:SELF%PTR)
+#endif
+ENDIF
+NULLIFY (SELF%PTR)
+IF (C_ASSOCIATED (SELF%HANDLE)) CALL TBBPOOL_DESTROY (SELF%HANDLE)
+SELF%HANDLE = C_NULL_PTR
+
+END SUBROUTINE FIAT_TBBPOOL_FINAL
+
+! Remet le pool à zéro (tous les pointeurs obtenus deviennent invalides)
+SUBROUTINE FIAT_TBBPOOL_RECYCLE (SELF)
+
+CLASS (FIAT_TBBPOOL) :: SELF
+
+CALL TBBPOOL_RECYCLE (SELF%HANDLE)
+
+END SUBROUTINE FIAT_TBBPOOL_RECYCLE
+
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+#:for bound in bounds
+
+#:set suffix = bound + str (rank) + kind
+
+! SIDE_PARAM est accepté pour garder la même interface que FIAT_DOUBLESTACK, mais ignoré :
+! fixed_pool n'a pas de notion de côté bas / côté haut.
+SUBROUTINE FIAT_TBBALLOCATE_${suffix}$ (SELF, P, UBOUNDS, LBOUNDS, SIDE_PARAM)
+
+CLASS (FIAT_TBBPOOL) :: SELF
+${type}$ (KIND=JP${kind}$), POINTER, CONTIGUOUS :: P (${ ','.join ([':'] * rank) }$)
+INTEGER (KIND=JP${bound}$), INTENT (IN) :: UBOUNDS (${rank}$)
+INTEGER (KIND=JP${bound}$), INTENT (IN), OPTIONAL :: LBOUNDS (${rank}$)
+INTEGER (KIND=C_INT8_T), INTENT (IN), OPTIONAL :: SIDE_PARAM
+
+INTEGER (KIND=JP${bound}$) :: ILBOUNDS (${rank}$)
+TYPE (C_PTR) :: PTR
+INTEGER (KIND=C_SIZE_T) :: ISIZE
+
+ILBOUNDS = 1
+IF (PRESENT (LBOUNDS)) ILBOUNDS = LBOUNDS
+
+IF (.NOT. C_ASSOCIATED (SELF%HANDLE)) THEN
+  ALLOCATE (P (${','.join (map (lambda i: "ILBOUNDS(" + str (i) + "):UBOUNDS (" + str (i) + ")", range (1, rank+1)))}$))
+  RETURN
+ENDIF
+
+ISIZE = INT (KIND (P), C_SIZE_T)
+#:for i in range (1, rank+1, 1)
+ISIZE = ISIZE * INT (UBOUNDS(${i}$)-ILBOUNDS(${i}$)+1, C_SIZE_T)
+#:endfor
+
+PTR = TBBPOOL_ALLOC (SELF%HANDLE, ISIZE)
+IF (.NOT. C_ASSOCIATED (PTR)) THEN
+  WRITE (0,*) "ERROR : TBBPOOL OVERALLOCATED, FIAT_TBBPOOL_MOD, REQUESTED BYTES: ", ISIZE
+  CALL ABORT
+ENDIF
+
+CALL C_F_POINTER (PTR, P, UBOUNDS-ILBOUNDS+1)
+
+P (${ ', '.join (map (lambda i: 'ILBOUNDS (' + str (i) + '):', range (1, rank+1))) }$) => P
+
+END SUBROUTINE FIAT_TBBALLOCATE_${suffix}$
+#:endfor
+#:endfor
+#:endfor
+
+
+#:for rank in ranks
+#:for type, kind in zip (types, kinds)
+#:set suffix = str (rank) + kind
+SUBROUTINE FIAT_TBBDEALLOCATE_${suffix}$ (SELF, P)
+
+CLASS (FIAT_TBBPOOL) :: SELF
+${type}$ (KIND=JP${kind}$), POINTER, CONTIGUOUS :: P (${ ','.join ([':'] * rank) }$)
+
+TYPE (C_PTR) :: PTR
+
+IF (.NOT. ASSOCIATED (P)) THEN
+  RETURN
+ENDIF
+
+IF (.NOT. C_ASSOCIATED (SELF%HANDLE)) THEN
+  DEALLOCATE (P)
+  P => NULL ()
+  RETURN
+ENDIF
+
+PTR = C_LOC (P (${ ', '.join (map (lambda i: 'LBOUND (P, ' + str (i) + ')', range (1, rank+1))) }$))
+
+CALL TBBPOOL_FREE (SELF%HANDLE, PTR)
+
+P => NULL ()
+
+END SUBROUTINE FIAT_TBBDEALLOCATE_${suffix}$
+
+#:endfor
+#:endfor
+
+END MODULE FIAT_TBBPOOL_MOD
